@@ -1,25 +1,67 @@
+use std::mem::take;
+
 use anyhow::anyhow;
-use axum::extract::Query;
-use axum::routing::{get, get_service, post};
-use axum::{Json, Router};
-use serde::Deserialize;
+use axum::extract::{Path, Query};
+use axum::routing::{get, get_service, post, MethodRouter};
+use axum::{Extension, Json, Router};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tower_http::services::ServeDir;
 
 use crate::docker::Container;
 use crate::errors::AppError;
+use crate::github::Client;
 
-type Result = anyhow::Result<Json<Value>, AppError>;
+type Result<T = Value> = anyhow::Result<Json<T>, AppError>;
+
+const MAIN: &str = "main.nr";
+const PROVER: &str = "Prover.nr";
 
 pub(crate) fn init() -> Router {
+    let github_token = std::env::var("GITHUB_TOKEN").unwrap_or_default();
     let root_files = ServeDir::new("static").precompressed_gzip();
+
     Router::new()
         .fallback_service(get_service(root_files))
-        .route("/api/:channel/check", post(check))
-        .route("/api/:channel/compile", post(compile))
-        .route("/api/:channel/execute", post(execute))
-        .route("/api/:channel/fmt", post(fmt))
-        .route("/api/:channel/version", get(version))
+        .route("/api/gist", post(gist_create))
+        .route("/api/gist/:id", get(gist_view))
+        .route("/api/nargo/:channel/check", mk_service("check"))
+        .route("/api/nargo/:channel/compile", mk_service("compile"))
+        .route("/api/nargo/:channel/execute", mk_service("execute"))
+        .route("/api/nargo/:channel/fmt", post(fmt))
+        .route("/api/nargo/:channel/version", get(version))
+        .layer(Extension(Client::new(github_token)))
+}
+
+fn mk_service(command: &'static str) -> MethodRouter {
+    post(|container: Container, Query(options): Query<Options>, Json(files): Json<Files>| async {
+        eval(command, container, files, options).await
+    })
+}
+
+async fn gist_create(Extension(client): Extension<Client>, Json(files): Json<Files>) -> Result {
+    let github = client.load()?;
+    let gist = github
+        .gists()
+        .create()
+        .file(MAIN, files.code)
+        .file(PROVER, files.input)
+        .public(false)
+        .send()
+        .await?;
+
+    Ok(json!({ "id": gist.id }).into())
+}
+
+async fn gist_view(Path(id): Path<String>, Extension(client): Extension<Client>) -> Result<Files> {
+    let github = client.load()?;
+
+    let mut files = github.gists().get(id).await?.files;
+
+    let code = files.get_mut(MAIN).and_then(|file| take(&mut file.content)).unwrap_or_default();
+    let input = files.get_mut(PROVER).and_then(|file| take(&mut file.content)).unwrap_or_default();
+
+    Ok(Files { code, input }.into())
 }
 
 async fn version(container: Container) -> Result {
@@ -30,30 +72,6 @@ async fn version(container: Container) -> Result {
     }
 
     Ok(Json(json!({"version": stdout })))
-}
-
-async fn check(
-    container: Container,
-    Query(options): Query<Options>,
-    Json(files): Json<Files>,
-) -> Result {
-    eval("check", container, files, options).await
-}
-
-async fn compile(
-    container: Container,
-    Query(options): Query<Options>,
-    Json(files): Json<Files>,
-) -> Result {
-    eval("compile", container, files, options).await
-}
-
-async fn execute(
-    container: Container,
-    Query(options): Query<Options>,
-    Json(files): Json<Files>,
-) -> Result {
-    eval("execute", container, files, options).await
 }
 
 async fn fmt(container: Container, Json(files): Json<Files>) -> Result {
@@ -87,7 +105,7 @@ async fn nargo_response(container: Container, stdout: String, stderr: String) ->
     Ok(json!({"compiler": compiler, "stdout": stdout, "stderr": stderr }).into())
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct Files {
     code: String,
     #[serde(default)]

@@ -3,6 +3,7 @@
 
 mod docker;
 mod errors;
+mod github;
 mod routes;
 
 #[tokio::main]
