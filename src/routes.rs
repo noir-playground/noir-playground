@@ -15,7 +15,7 @@ use crate::github::Client;
 type Result<T = Value> = anyhow::Result<Json<T>, AppError>;
 
 const MAIN: &str = "main.nr";
-const PROVER: &str = "Prover.nr";
+const PROVER: &str = "Prover.toml";
 
 pub(crate) fn init() -> Router {
     let github_token = std::env::var("GITHUB_TOKEN").unwrap_or_default();
