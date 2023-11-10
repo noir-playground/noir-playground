@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::mem::take;
 
 use anyhow::anyhow;
@@ -19,7 +20,7 @@ const PROVER: &str = "Prover.toml";
 
 pub(crate) fn init() -> Router {
     let github_token = std::env::var("GITHUB_TOKEN").unwrap_or_default();
-    let root_files = ServeDir::new("static").precompressed_gzip();
+    let root_files = ServeDir::new("dist").precompressed_gzip();
 
     Router::new()
         .fallback_service(get_service(root_files))
@@ -34,34 +35,37 @@ pub(crate) fn init() -> Router {
 }
 
 fn mk_service(command: &'static str) -> MethodRouter {
-    post(|container: Container, Query(options): Query<Options>, Json(files): Json<Files>| async {
+    post(|container: Container, Query(options): Query<Options>, Json(files): Json<Project>| async {
         eval(command, container, files, options).await
     })
 }
 
-async fn gist_create(Extension(client): Extension<Client>, Json(files): Json<Files>) -> Result {
+async fn gist_create(Extension(client): Extension<Client>, Json(project): Json<Project>) -> Result {
+    let mut files = project.files;
     let github = client.load()?;
-    let gist = github
-        .gists()
-        .create()
-        .file(MAIN, files.code)
-        .file(PROVER, files.input)
-        .public(false)
-        .send()
-        .await?;
+
+    let main = files.get_mut(MAIN).map(take).unwrap_or_default().content;
+    let prover = files.get_mut(PROVER).map(take).unwrap_or_default().content;
+
+    let gist =
+        github.gists().create().file(MAIN, main).file(PROVER, prover).public(false).send().await?;
 
     Ok(json!({ "id": gist.id }).into())
 }
 
-async fn gist_view(Path(id): Path<String>, Extension(client): Extension<Client>) -> Result<Files> {
+async fn gist_view(
+    Path(id): Path<String>,
+    Extension(client): Extension<Client>,
+) -> Result<Project> {
     let github = client.load()?;
 
-    let mut files = github.gists().get(id).await?.files;
+    let files = github.gists().get(id).await?.files;
+    let files = files
+        .into_iter()
+        .map(|(key, value)| (key, File { content: value.content.unwrap_or_default() }))
+        .collect();
 
-    let code = files.get_mut(MAIN).and_then(|file| take(&mut file.content)).unwrap_or_default();
-    let input = files.get_mut(PROVER).and_then(|file| take(&mut file.content)).unwrap_or_default();
-
-    Ok(Files { code, input }.into())
+    Ok(Project { files }.into())
 }
 
 async fn version(container: Container) -> Result {
@@ -71,12 +75,12 @@ async fn version(container: Container) -> Result {
         return Err(anyhow!("unknown error").into());
     }
 
-    Ok(Json(json!({"version": stdout })))
+    Ok(json!({"version": stdout }).into())
 }
 
-async fn fmt(container: Container, Json(files): Json<Files>) -> Result {
-    container.write_source(files.code)?;
-    container.write_prover(files.input)?;
+async fn fmt(container: Container, Json(mut project): Json<Project>) -> Result {
+    container.write_source(project.take_source().content)?;
+    container.write_prover(project.take_prover().content)?;
 
     let _ = container.nargo(&["fmt"]).await?;
     let code = container.read_source()?;
@@ -87,29 +91,44 @@ async fn fmt(container: Container, Json(files): Json<Files>) -> Result {
 async fn eval(
     command: &str,
     container: Container,
-    files: Files,
+    mut files: Project,
     options: Options,
 ) -> std::result::Result<Json<Value>, AppError> {
-    container.write_source(files.code)?;
-    container.write_prover(files.input)?;
+    container.write_source(files.take_source().content)?;
+    container.write_prover(files.take_prover().content)?;
 
     let args: Vec<_> = Some(command).into_iter().chain(options.args()).collect();
 
     let (stdout, stderr) = container.nargo(&args).await?;
-    nargo_response(container, stdout, stderr).await
+
+    let stdout = ansi_to_html::convert_escaped(&stdout).unwrap_or(stdout);
+    let stderr = ansi_to_html::convert_escaped(&stderr).unwrap_or(stderr);
+
+    nargo_response(stdout, stderr).await
 }
 
-async fn nargo_response(container: Container, stdout: String, stderr: String) -> Result {
-    let (compiler, _) = container.nargo(&["--version"]).await?;
-
-    Ok(json!({"compiler": compiler, "stdout": stdout, "stderr": stderr }).into())
+async fn nargo_response(stdout: String, stderr: String) -> Result {
+    Ok(json!({"stdout": stdout, "stderr": stderr }).into())
 }
 
 #[derive(Deserialize, Serialize)]
-struct Files {
-    code: String,
-    #[serde(default)]
-    input: String,
+struct Project {
+    files: HashMap<String, File>,
+}
+
+#[derive(Default, Deserialize, Serialize)]
+struct File {
+    content: String,
+}
+
+impl Project {
+    fn take_source(&mut self) -> File {
+        self.files.get_mut(MAIN).map(take).unwrap_or_default()
+    }
+
+    fn take_prover(&mut self) -> File {
+        self.files.get_mut(PROVER).map(take).unwrap_or_default()
+    }
 }
 
 #[derive(Deserialize)]

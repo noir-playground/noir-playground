@@ -37,11 +37,13 @@ impl Container {
     }
 
     pub(crate) fn write_source(&self, code: String) -> Result<()> {
-        std::fs::write(&self.source_file, code).map_err(|_| anyhow!("failed to write source code"))
+        std::fs::write(&self.source_file, code)
+            .map_err(|_| anyhow!("failed to write `main/src.nr`"))
     }
 
     pub(crate) fn write_prover(&self, code: String) -> Result<()> {
-        std::fs::write(&self.prover_file, code).map_err(|_| anyhow!("failed to write Prover.toml"))
+        std::fs::write(&self.prover_file, code)
+            .map_err(|_| anyhow!("failed to write `Prover.toml`"))
     }
 
     pub(crate) async fn nargo(&self, args: &[&str]) -> Result<(String, String)> {
